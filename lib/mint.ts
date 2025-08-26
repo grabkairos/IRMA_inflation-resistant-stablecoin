@@ -1,12 +1,6 @@
-import { Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
+import { Connection, PublicKey, Transaction } from "@solana/web3.js";
 import { AnchorProvider, BN } from "@coral-xyz/anchor";
-import {
-  OpenBookV2Client,
-  OrderType,
-  PlaceOrderArgs,
-  SelfTradeBehavior,
-  Side,
-} from "@openbook-dex/openbook-v2";
+import { OpenBookV2Client, PlaceOrderArgs } from "@openbook-dex/openbook-v2";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 
 // Constants
@@ -115,27 +109,73 @@ async function createOpenBookV2OrderInstruction(
     // Create the OpenBook v2 client using the correct API pattern for version 0.2.10
     const client = new OpenBookV2Client(provider, OPENBOOK_V2_PROGRAM_ID);
 
-    const market = await client.deserializeMarketAccount(marketAddress);
+    const market = await client.program.account.market.fetch(marketAddress);
 
     const [createOpenOrdersIxs, openOrdersAccount] =
       await client.createOpenOrdersIx(marketAddress, "IRMA-USDC", wallet, null);
     if (!market) throw new Error("Market not found");
 
-    const priceLots = new BN(
-      Math.floor((orderParams.price * market.baseLotSize) / market.quoteLotSize)
+    // Debug market lot sizes
+    console.log("Market lot sizes:");
+    console.log("- baseLotSize:", market.baseLotSize.toString());
+    console.log("- quoteLotSize:", market.quoteLotSize.toString());
+    console.log("Order params:");
+    console.log("- price (micro-units):", orderParams.price.toString());
+    console.log("- size (micro-units):", orderParams.size.toString());
+
+    // Keep calculations in micro-units to avoid precision loss
+    const priceInMicroUnits = orderParams.price.toNumber(); // Already in micro USDC
+    const sizeInMicroUnits = orderParams.size.toNumber(); // Already in micro tokens
+
+    console.log("Order params (micro-units):");
+    console.log("- price (micro USDC):", priceInMicroUnits);
+    console.log("- size (micro tokens):", sizeInMicroUnits);
+
+    // Convert to human-readable for logging
+    const priceInBaseUnits = priceInMicroUnits / 1000000;
+    const sizeInBaseUnits = sizeInMicroUnits / 1000000;
+
+    console.log("Converted to base units (for display):");
+    console.log("- price (USDC):", priceInBaseUnits);
+    console.log("- size (tokens):", sizeInBaseUnits);
+
+    // Calculate price lots: price per token * quote_lot_size / base_lot_size
+    // Keep precision by working with larger numbers
+    const priceLotsCalculation =
+      (priceInMicroUnits * market.quoteLotSize.toNumber()) /
+      (market.baseLotSize.toNumber() * 1000000);
+    const priceLots = new BN(Math.max(1, Math.floor(priceLotsCalculation)));
+
+    // Calculate max base lots: tokens to buy / base_lot_size (in native units)
+    const maxBaseLots = new BN(
+      Math.floor(sizeInMicroUnits / market.baseLotSize.toNumber())
     );
-    const sizeLots = new BN(
-      Math.floor(orderParams.size / (market.baseLotSize / 1_000_000))
+
+    // Calculate max quote lots: max USDC to spend / quote_lot_size (in native units)
+    const totalQuoteNeeded =
+      (priceInMicroUnits * sizeInMicroUnits * 1.1) / 1000000; // Total micro USDC * safety factor
+    const maxQuoteLotsIncludingFees = new BN(
+      Math.floor(totalQuoteNeeded / market.quoteLotSize.toNumber())
     );
+
+    console.log("Calculated lots:");
+    console.log("- priceLots:", priceLots.toString());
+    console.log("- maxBaseLots:", maxBaseLots.toString());
+    console.log(
+      "- maxQuoteLotsIncludingFees:",
+      maxQuoteLotsIncludingFees.toString()
+    );
+
     const orderArgs: PlaceOrderArgs = {
-      side: { ask: {} },
+      side: { ask: {} }, // Use 'ask' for sell orders (bid is for buy orders)
       priceLots: priceLots,
+      maxBaseLots: maxBaseLots,
+      maxQuoteLotsIncludingFees: maxQuoteLotsIncludingFees,
       clientOrderId: new BN(Date.now()),
-      orderType: OrderType.Limit,
-      selfTradeBehavior: SelfTradeBehavior.DecrementTake,
-      matchLimit: new BN(10),
+      orderType: { limit: {} },
+      expiryTimestamp: new BN("18446744073709551615"), // Max timestamp for no expiry
+      selfTradeBehavior: { decrementTake: {} },
       limit: 10,
-      maxTs: new BN("18446744073709551615"),
     };
     const userTokenAccount = getAssociatedTokenAddressSync(
       market.baseMint,
@@ -145,14 +185,13 @@ async function createOpenBookV2OrderInstruction(
     console.log("market.marketBaseVault", market.marketBaseVault.toBase58());
     console.log("market.marketQuoteVault", market.marketQuoteVault.toBase58());
 
-    const [ix, signers] = await client.placeOrderIx(
+    const [ix] = await client.placeOrderIx(
       openOrdersAccount,
       marketAddress,
       market,
       userTokenAccount,
-      null,
       orderArgs,
-      []
+      [] // remaining accounts - empty array for basic orders
     );
 
     const tx = new Transaction().add(...createOpenOrdersIxs);
@@ -195,7 +234,7 @@ export async function mintIrmaToken(
     await rateLimiter.throttle();
 
     console.log(
-      `Minting ${amount} IRMA tokens for wallet: ${wallet.toString()}`
+      `Selling ${amount} IRMA tokens for wallet: ${wallet.toString()}`
     );
 
     // Get working connection
@@ -224,18 +263,18 @@ export async function mintIrmaToken(
     const pricePerToken = usdcAmount / amount; // 1.04 USDC per IRMA
 
     console.log(
-      `Placing market buy order for ${amount} IRMA tokens at ${pricePerToken} USDC per token`
+      `Placing market sell order for ${amount} IRMA tokens at ${pricePerToken} USDC per token`
     );
 
-    // Create the real buy order parameters
+    // Create the real sell order parameters
     const orderParams = {
-      side: { bid: {} }, // not "bid"
-      price: new BN(pricePerToken), // must be BN
-      size: new BN(amount), // must be BN
-      orderType: { limit: {} }, // not "limit"
-      selfTradeBehavior: { decrementTake: {} }, // required
-      clientId: new BN(Date.now()), // BN, not number
-      reduceOnly: false, // still okay
+      side: { ask: {} }, // Sell order
+      price: new BN(Math.floor(pricePerToken * 1000000)), // Price in micro-units (6 decimals for USDC)
+      size: new BN(Math.floor(amount * 1000000)), // Size in micro-units (6 decimals)
+      orderType: { limit: {} },
+      selfTradeBehavior: { decrementTake: {} },
+      clientId: new BN(Date.now()),
+      reduceOnly: false,
     };
 
     console.log("Order parameters:", orderParams);
@@ -271,11 +310,11 @@ export async function mintIrmaToken(
       "- Instructions count:",
       orderResult.transaction?.instructions.length || 0
     );
-    console.log("- Order type: Limit Buy");
-    console.log("- Side: Bid (Buy)");
+    console.log("- Order type: Limit Sell");
+    console.log("- Side: Ask (Sell)");
     console.log("- OpenBook v2 Program ID:", OPENBOOK_V2_PROGRAM_ID.toString());
 
-    console.log(`✅ Successfully created buy order for ${amount} IRMA tokens`);
+    console.log(`✅ Successfully created sell order for ${amount} IRMA tokens`);
     console.log(`Order ID: ${orderResult.orderId}`);
     console.log(`Price: ${orderParams.price} USDC per IRMA`);
     console.log(`Total USDC: ${usdcAmount}`);
@@ -340,10 +379,7 @@ export async function getMarketPrice(): Promise<number | null> {
 }
 
 // Function to get order status (placeholder for OpenBook v2 integration)
-export async function getOrderStatus(
-  orderId: string,
-  userWallet: PublicKey
-): Promise<{
+export async function getOrderStatus(orderId: string): Promise<{
   status: "pending" | "filled" | "cancelled" | "error";
   filledAmount?: number;
   remainingAmount?: number;
