@@ -1,7 +1,10 @@
 import { Connection, PublicKey, Transaction } from "@solana/web3.js";
 import { AnchorProvider, BN } from "@coral-xyz/anchor";
 import { OpenBookV2Client, PlaceOrderArgs } from "@openbook-dex/openbook-v2";
-import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import {
+  createAssociatedTokenAccountInstruction,
+  getAssociatedTokenAddressSync,
+} from "@solana/spl-token";
 
 // Constants
 const MARKET_ADDRESS = new PublicKey(
@@ -193,8 +196,24 @@ async function createOpenBookV2OrderInstruction(
       orderArgs,
       [] // remaining accounts - empty array for basic orders
     );
-
     const tx = new Transaction().add(...createOpenOrdersIxs);
+    const userIRMAAccount = getAssociatedTokenAddressSync(
+      market.baseMint,
+      wallet
+    );
+    const accountInfo = await connection.getAccountInfo(userIRMAAccount);
+    if (!accountInfo) {
+      const createAccountIx = await createAssociatedTokenAccountInstruction(
+        wallet,
+        userIRMAAccount,
+        wallet,
+        market.baseMint
+      );
+      tx.add(createAccountIx);
+    }
+
+    console.log("accountInfo", accountInfo);
+
     tx.add(ix);
     const recentBlockhash = await connection.getLatestBlockhash();
     tx.recentBlockhash = recentBlockhash.blockhash;
